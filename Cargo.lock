@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "vandelay"
-version = "1.0.11"
+version = "1.0.11-zimbra.1"
 dependencies = [
  "blake3",
  "calcard",
