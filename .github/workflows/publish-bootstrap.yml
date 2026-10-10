@@ -1,0 +1,42 @@
+name: Publish validated Zimbra integration
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Validate and retain prepared release assets
+        run: |
+          sha256sum -c release-SHA256SUMS
+          mkdir -p "$RUNNER_TEMP/vandelay-release"
+          cp vandelay-linux-amd64.tar.gz vandelay-zimbra.bundle release-SHA256SUMS "$RUNNER_TEMP/vandelay-release/"
+          mv "$RUNNER_TEMP/vandelay-release/release-SHA256SUMS" "$RUNNER_TEMP/vandelay-release/SHA256SUMS"
+      - name: Integrate validated source with full Git history
+        run: |
+          git fetch ./vandelay-zimbra.bundle zimbra-upstream-sync
+          git checkout -b validated-integration FETCH_HEAD
+          test "$(git rev-parse HEAD)" = d01ad411e501ed97fe55c8d39b9fb61c56a06bed
+          test "$(git rev-parse 'HEAD^{tree}')" = cbfc581f50156fa809d7599dfcb84bc80a9a49d2
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Keep the temporary upload commits in ancestry, with the exact validated tree.
+          git merge --no-ff --strategy=ours origin/main -m 'Publish validated upstream integration, retaining bootstrap history'
+          test "$(git rev-parse 'HEAD^{tree}')" = cbfc581f50156fa809d7599dfcb84bc80a9a49d2
+          git push origin HEAD:main
+          git tag v1.0.11-zimbra.1
+          git push origin v1.0.11-zimbra.1
+      - name: Publish prepared Linux amd64 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.0.11-zimbra.1 \
+            "$RUNNER_TEMP/vandelay-release/vandelay-linux-amd64.tar.gz" \
+            "$RUNNER_TEMP/vandelay-release/vandelay-zimbra.bundle" \
+            "$RUNNER_TEMP/vandelay-release/SHA256SUMS" \
+            --title 'Vandelay 1.0.11-zimbra.1 — Linux amd64 / Zimbra' \
+            --notes-file ZIMBRA.md
