@@ -27,6 +27,12 @@ jobs:
           # Keep the temporary upload commits in ancestry, with the exact validated tree.
           git merge --no-ff --strategy=ours origin/main -m 'Publish validated upstream integration, retaining bootstrap history'
           test "$(git rev-parse 'HEAD^{tree}')" = cbfc581f50156fa809d7599dfcb84bc80a9a49d2
+          # Workflows are installed separately through the owner browser session.
+          # Keep them unchanged: the Actions token only needs contents permission.
+          git restore --source=origin/main --staged --worktree .github/workflows
+          git commit -m 'Retain owner-installed release workflows'
+          git diff --exit-code origin/main HEAD -- .github/workflows
+          git diff --exit-code d01ad411e501ed97fe55c8d39b9fb61c56a06bed HEAD -- . ':!.github/workflows'
           git push origin HEAD:main
           git tag v1.0.11-zimbra.1
           git push origin v1.0.11-zimbra.1
