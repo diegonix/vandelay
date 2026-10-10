@@ -29,11 +29,12 @@ use crate::jmap::http::{Auth, HttpClient};
 use crate::jmap::request::{get_all, get_changes, get_objects, get_state, query_all_ids};
 use crate::jmap::session::{Limits, Session};
 use crate::jmap::wire::JmapId;
+use crate::jmap::wire::common::parse_utc_date;
 use crate::jmap::wire::email::Email;
 use crate::jmap::wire::file_node::{FileNode, NodeType};
 use crate::jmap::wire::sieve_script::SieveScript;
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
-use crate::sync::{CommonConfig, Context, ImportConfig, Summary, TypeCounts};
+use crate::sync::{CommonConfig, Context, ImportConfig, RunOutcome, Summary, TypeCounts};
 use crate::types::ObjectType;
 
 const IMPORT_ORDER: [ObjectType; 10] = [
@@ -148,6 +149,20 @@ fn username_of(auth: &Auth) -> String {
 }
 
 pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error> {
+    run_reporting(common, config).into_result()
+}
+
+pub fn run_reporting(common: CommonConfig, config: ImportConfig) -> RunOutcome {
+    let mut summary = Summary::default();
+    let error = run_into(common, config, &mut summary).err();
+    RunOutcome { summary, error }
+}
+
+fn run_into(
+    common: CommonConfig,
+    config: ImportConfig,
+    summary: &mut Summary,
+) -> Result<(), Error> {
     let logger = common.logger;
     let ctx = Context::open(common, &config.connect)?;
     let connected = connect::prepare(&ctx, &config.connect)?;
@@ -197,7 +212,6 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
         session: connected.session.clone(),
     };
 
-    let mut summary = Summary::default();
     let mut dry_rows: Vec<(&'static str, u64, u64, u64)> = Vec::new();
     let threads = ctx.common.threads;
 
@@ -217,6 +231,7 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
             &mut dry_rows,
         ) {
             Ok(()) => {}
+            Err(e) if e.aborts_run() => return Err(e),
             Err(e) => {
                 logger.warn(&format!(
                     "type {} aborted: {e}; continuing (run will exit 5)",
@@ -230,7 +245,8 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
 
     if ctx.dry_run() {
         print_dry_run(&dry_rows);
-        return Ok(Summary::default());
+        *summary = Summary::default();
+        return Ok(());
     }
 
     if !summary.any_failed()
@@ -241,7 +257,7 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
 
     summary.retries_observed = ctx.client.retries_observed();
     summary.retry_after_sleeps = ctx.client.retry_after_sleeps();
-    Ok(summary)
+    Ok(())
 }
 
 fn work_list(config: &ImportConfig, connected: &Connected) -> Vec<ObjectType> {
@@ -464,7 +480,7 @@ fn insert_objects(
                     continue;
                 }
             };
-            match insert_one(&tx, ty, source_id, obj, &blobs) {
+            match insert_one(&tx, ty, source_id, obj, &blobs, logger) {
                 Ok(local_id) => {
                     db::ids::insert(&tx, source_id, ty, &jmap_id, local_id)
                         .map_err(|e| Error::Partial(e.to_string()))?;
@@ -635,6 +651,7 @@ fn insert_one(
     source_id: i64,
     obj: &Value,
     blobs: &HashMap<String, Vec<u8>>,
+    logger: &Logger,
 ) -> Result<i64, JmapError> {
     let resolver = DbResolver { conn, source_id };
     match ty {
@@ -659,14 +676,28 @@ fn insert_one(
             mapping::insert_participant_identity(conn, &w)
         }
         ObjectType::Email => {
-            let w: Email = serde_json::from_value(obj.clone())?;
+            let mut w: Email = serde_json::from_value(obj.clone())?;
             let data = blobs
                 .get(&w.blob_id.0)
                 .ok_or_else(|| JmapError::malformed("email blob missing"))?;
             let blob_local = db::blobs::intern_blob(conn, data)?;
-            let mm = crate::sync::keys::index_to_json(
-                &crate::sync::emailmeta::email_index_from_blob(data),
-            );
+            let (index, date_header) = crate::sync::emailmeta::email_meta_from_blob(data);
+            let mm = crate::sync::keys::index_to_json(&index);
+            if w.received_at.is_none() {
+                w.received_at = date_header.as_deref().and_then(parse_utc_date);
+                let id = obj.get("id").and_then(Value::as_str).unwrap_or("?");
+                let raw = obj
+                    .get("receivedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
+                logger.warn(&format!(
+                    "Email {id}: unusable receivedAt {raw:?}; falling back to {}",
+                    match &w.received_at {
+                        Some(_) => "the Date header",
+                        None => "1970-01-01T00:00:00Z",
+                    }
+                ));
+            }
             mapping::insert_email(conn, &w, blob_local, &mm, &resolver)
         }
         ObjectType::SieveScript => {
@@ -679,7 +710,7 @@ fn insert_one(
         }
         ObjectType::FileNode => {
             let w: FileNode = serde_json::from_value(obj.clone())?;
-            let blob_local = match (&w.node_type, &w.blob_id) {
+            let blob_local = match (w.effective_node_type(), &w.blob_id) {
                 (NodeType::File, Some(b)) => {
                     let data = blobs
                         .get(&b.0)
@@ -920,7 +951,7 @@ fn update_one(
         }
         ObjectType::FileNode => {
             let w: FileNode = serde_json::from_value(obj.clone())?;
-            let blob_local = match (&w.node_type, &w.blob_id) {
+            let blob_local = match (w.effective_node_type(), &w.blob_id) {
                 (NodeType::File, Some(b)) => {
                     let data = blobs
                         .get(&b.0)

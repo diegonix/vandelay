@@ -7,8 +7,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::time::Instant;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use encodify::base64::STANDARD;
 
 use crate::imap::transport::{Connector, ImapStream};
 use crate::logging::Logger;
@@ -151,8 +150,12 @@ impl SieveClient {
         let started = Instant::now();
         self.write_all(command.as_bytes())?;
         let block = read_response(&mut self.reader)?;
-        self.logger
-            .trace_cmd("SIEVE", command, &sieve_status(&block.status), started.elapsed());
+        self.logger.trace_cmd(
+            "SIEVE",
+            command,
+            &sieve_status(&block.status),
+            started.elapsed(),
+        );
         finish_block(block, &mut self.closed)
     }
 
@@ -198,17 +201,17 @@ impl SieveClient {
         password: &str,
     ) -> Result<(), SieveError> {
         let payload = sasl_plain_payload(authzid, authcid, password);
-        let encoded = BASE64.encode(&payload);
+        let encoded = STANDARD.encode(&payload);
         self.send_authenticate("PLAIN", &encoded)
     }
 
     pub fn authenticate_login(&mut self, authcid: &str, password: &str) -> Result<(), SieveError> {
         self.fresh_post_auth_caps = false;
         self.write_all(command::authenticate("LOGIN").as_bytes())?;
-        let user_payload = BASE64.encode(authcid.as_bytes());
+        let user_payload = STANDARD.encode(authcid);
         self.expect_continuation()?;
         self.write_all(command::continuation_payload(&user_payload).as_bytes())?;
-        let pass_payload = BASE64.encode(password.as_bytes());
+        let pass_payload = STANDARD.encode(password);
         self.expect_continuation()?;
         self.write_all(command::continuation_payload(&pass_payload).as_bytes())?;
         let block = read_response(&mut self.reader)?;
@@ -234,7 +237,7 @@ impl SieveClient {
         payload.push_str(token);
         payload.push('\x01');
         payload.push('\x01');
-        let encoded = BASE64.encode(payload.as_bytes());
+        let encoded = STANDARD.encode(&payload);
         self.send_authenticate("OAUTHBEARER", &encoded)
     }
 
@@ -333,8 +336,7 @@ impl SieveClient {
 /// as another mailbox).
 fn sasl_plain_payload(authzid: Option<&str>, authcid: &str, password: &str) -> Vec<u8> {
     let authzid_len = authzid.map_or(0, str::len);
-    let mut payload: Vec<u8> =
-        Vec::with_capacity(authzid_len + authcid.len() + password.len() + 2);
+    let mut payload: Vec<u8> = Vec::with_capacity(authzid_len + authcid.len() + password.len() + 2);
     if let Some(authzid) = authzid {
         payload.extend_from_slice(authzid.as_bytes());
     }

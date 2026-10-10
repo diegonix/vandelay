@@ -12,7 +12,7 @@ use regex::Regex;
 use crate::error::Error;
 use crate::exchange_ews::oauth::OAuthFlow;
 use crate::exchange_ews::types::MailboxKind;
-use crate::exchange_graph::types::{EventBodyFormat, MailboxKind as GraphMailboxKind};
+use crate::exchange_graph::types::{EventBodyFormat, MailboxKind as GraphMailboxKind, Surfaces};
 use crate::inspect::InspectConfig;
 use crate::jmap::account::AccountSelector;
 use crate::jmap::http::Auth;
@@ -760,9 +760,9 @@ fn resolve_dav_auth(
     auth_cookie: Option<&str>,
 ) -> Result<DavAuth, Error> {
     if let Some(cookie) = auth_cookie {
-        let (name, value) = cookie.split_once('=').ok_or_else(|| {
-            Error::Usage("--auth-cookie must be in NAME=VALUE form".to_owned())
-        })?;
+        let (name, value) = cookie
+            .split_once('=')
+            .ok_or_else(|| Error::Usage("--auth-cookie must be in NAME=VALUE form".to_owned()))?;
         if name.is_empty() || value.is_empty() {
             return Err(Error::Usage(
                 "--auth-cookie must be in NAME=VALUE form".to_owned(),
@@ -786,7 +786,9 @@ fn resolve_dav_auth(
         ));
     }
     let bearer = auth_bearer.ok_or_else(|| {
-        Error::Usage("exactly one of --auth-basic / --auth-bearer / --auth-cookie is required".to_owned())
+        Error::Usage(
+            "exactly one of --auth-basic / --auth-bearer / --auth-cookie is required".to_owned(),
+        )
     })?;
     let token = secret::resolve(bearer.as_deref(), "VANDELAY_TOKEN", "bearer token")?;
     Ok(DavAuth::Bearer { token })
@@ -1188,7 +1190,7 @@ pub struct ExchangeGraphImportArgs {
     #[arg(
         long,
         value_name = "LIST",
-        help = "Comma-separated surface list (mail,calendar,contacts; default all)"
+        help = "Comma-separated surface list: mail | calendar | contacts | files (default: all)"
     )]
     objects: Option<String>,
 
@@ -1216,6 +1218,32 @@ pub struct ExchangeGraphImportArgs {
         help = "Per-page size ($top query parameter, range [1, 1000])"
     )]
     top: usize,
+
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 5,
+        help = "Years either side of today to scan for edited recurrence occurrences (max 5)",
+        long_help = "Years either side of today to scan for edited recurrence occurrences.\n  \
+            Graph reports a series exception only inside an expanded calendar view, and caps\n  \
+            any single view at five years, so vandelay scans [today - N, today] and\n  \
+            [today, today + N]. An occurrence edited outside that span imports with the\n  \
+            series default instead of its edit."
+    )]
+    exception_window_years: i32,
+
+    #[arg(
+        long,
+        help = "Skip contact photos (saves one request per contact on large address books)",
+        long_help = "Skip contact photos.\n              Graph will not say which contacts have a photo: $expand=photo comes back empty\n              even when one exists, so the only way to find out is to ask for the bytes.\n              vandelay therefore spends one extra request per contact. Pass this to skip\n              photos entirely on a large address book."
+    )]
+    skip_contact_photos: bool,
+
+    #[arg(
+        long,
+        help = "Skip event file attachments (they are stored as JSCalendar enclosure links)"
+    )]
+    skip_event_attachments: bool,
 
     #[arg(
         long,
@@ -1259,11 +1287,12 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
         args.client_id.as_deref(),
         &args.tenant,
     )?;
-    let objects = args
+    let surfaces = args
         .objects
         .as_deref()
-        .map(crate::types::parse_object_list)
-        .transpose()?;
+        .map(Surfaces::parse_list)
+        .transpose()?
+        .unwrap_or_default();
     let top = args.top.clamp(1, 1000);
     let graph_connections = args
         .graph_connections
@@ -1276,10 +1305,13 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
             api_base: args.api_base,
             user_target: args.user,
             mailbox_kind,
-            objects,
+            surfaces,
             event_body_format,
             graph_connections,
             top,
+            exception_window_years: args.exception_window_years,
+            contact_photos: !args.skip_contact_photos,
+            event_attachments: !args.skip_event_attachments,
             allow_source_change: args.allow_source_change,
         },
     ))
@@ -1416,5 +1448,59 @@ mod tests {
         let bearer: Option<String> = Some("t".to_owned());
         let auth = resolve_auth(None, None, Some(&bearer)).unwrap();
         assert!(matches!(auth, Auth::Bearer { token } if token == "t"));
+    }
+
+    fn graph_config(objects: &[&str]) -> Result<GraphImportConfig, Error> {
+        let mut argv = vec![
+            "vandelay",
+            "import",
+            "exchange-graph",
+            "--access-token",
+            "tok",
+        ];
+        argv.extend_from_slice(objects);
+        argv.push("archive.sqlite");
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("clap rejected args: {e}"));
+        match cli.resolve()? {
+            Action::ImportExchangeGraph(_, config) => Ok(config),
+            _ => panic!("expected ImportExchangeGraph"),
+        }
+    }
+
+    #[test]
+    fn graph_objects_contacts_selects_only_contacts() {
+        let _g = lock();
+        let config = graph_config(&["--objects", "contacts"]).unwrap();
+        assert_eq!(
+            config.surfaces,
+            Surfaces {
+                mail: false,
+                calendar: false,
+                contacts: true,
+                files: false
+            }
+        );
+    }
+
+    #[test]
+    fn graph_objects_absent_selects_every_surface() {
+        let _g = lock();
+        let config = graph_config(&[]).unwrap();
+        assert_eq!(config.surfaces, Surfaces::ALL);
+    }
+
+    #[test]
+    fn graph_objects_rejects_jmap_type_names() {
+        let _g = lock();
+        match graph_config(&["--objects", "contactcard"]) {
+            Err(Error::Usage(m)) => {
+                assert!(m.contains("unknown surface: contactcard"), "msg was: {m}");
+                assert!(
+                    m.contains("valid: mail, calendar, contacts"),
+                    "msg was: {m}"
+                );
+            }
+            other => panic!("expected Usage error, got {:?}", other.map(|_| ())),
+        }
     }
 }

@@ -20,7 +20,6 @@ use crate::error::Error;
 use crate::imap::client::{ConnectMode, ImapClient};
 use crate::imap::command;
 use crate::imap::error::ImapError;
-use crate::imap::name::encode_mailbox_name_with;
 use crate::imap::response::{NamespaceEntry, Untagged};
 use crate::imap::retry::{
     BackoffState, Disposition, RetryPolicy, classify, is_negotiation_failure,
@@ -29,7 +28,7 @@ use crate::imap::transport::Connector;
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 use crate::sync::emailmeta::email_index_from_blob;
 use crate::sync::keys::index_to_json;
-use crate::sync::{CommonConfig, Summary, TypeCounts};
+use crate::sync::{CommonConfig, RunOutcome, Summary, TypeCounts};
 
 use super::fetch;
 use super::folders::{
@@ -114,6 +113,14 @@ pub(super) fn control_run_collect(
             },
         }
     }
+}
+
+pub(super) fn select_folder(
+    client: &mut ImapClient,
+    ctx: &ControlCtx,
+    folder: &ResolvedFolder,
+) -> Result<crate::imap::CollectedResponse, Error> {
+    control_run_collect(client, ctx, &command::select(&folder.wire_name))
 }
 
 pub(super) fn call_with_retry<F, T>(
@@ -207,10 +214,27 @@ pub enum ImapAuth {
         /// as (Zimbra admin impersonation). `None` = normal, non-impersonated auth.
         proxy_user: Option<String>,
     },
-    Bearer { user: String, token: String },
+    Bearer {
+        user: String,
+        token: String,
+    },
 }
 
 pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Error> {
+    run_reporting(common, config).into_result()
+}
+
+pub fn run_reporting(common: CommonConfig, config: ImapImportConfig) -> RunOutcome {
+    let mut summary = Summary::default();
+    let error = run_into(common, config, &mut summary).err();
+    RunOutcome { summary, error }
+}
+
+fn run_into(
+    common: CommonConfig,
+    config: ImapImportConfig,
+    summary: &mut Summary,
+) -> Result<(), Error> {
     let logger = common.logger;
     let mut conn = db::init::open(&common.archive)?;
 
@@ -353,14 +377,15 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
 
     if common.dry_run {
         let existing_source = db::sources::find_source(&conn, &source_key)?;
-        return dry_run_summary(
+        *summary = dry_run_summary(
             &conn,
             existing_source,
             &mut client,
             &control_ctx,
             &resolved,
             logger,
-        );
+        )?;
+        return Ok(());
     }
 
     let mut mailbox_counts = TypeCounts::default();
@@ -422,6 +447,16 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
             &mut email_counts,
         ) {
             Ok(()) => {}
+            Err(e) if e.aborts_run() => {
+                pool.shutdown();
+                let _ = client.logout();
+                *summary = Summary {
+                    per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
+                    retries_observed: backoff.total_retries(),
+                    retry_after_sleeps: backoff.transient_retries() as u64,
+                };
+                return Err(e);
+            }
             Err(e) => {
                 log_at(
                     logger,
@@ -436,11 +471,12 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     pool.shutdown();
     let _ = client.logout();
 
-    Ok(Summary {
+    *summary = Summary {
         per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
         retries_observed: backoff.total_retries(),
         retry_after_sleeps: backoff.transient_retries() as u64,
-    })
+    };
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -721,8 +757,7 @@ fn reconcile_folder(
         }
     }
 
-    let wire_name = encode_mailbox_name_with(&folder.name, client.utf8_accept());
-    let resp = control_run_collect(client, control_ctx, &command::select(&wire_name))?;
+    let resp = select_folder(client, control_ctx, folder)?;
     let mut uidvalidity: u32 = 0;
     let mut uidnext: u32 = 0;
     for u in &resp.untagged {
@@ -808,6 +843,7 @@ fn reconcile_folder(
         for batch in &batches {
             pool.submit(FetchJob {
                 folder: folder.name.clone(),
+                wire_name: folder.wire_name.clone(),
                 uidvalidity,
                 uids: batch.to_vec(),
             });
@@ -1143,8 +1179,7 @@ fn dry_run_summary(
     }
 
     for folder in folders {
-        let wire = encode_mailbox_name_with(&folder.name, client.utf8_accept());
-        let select_resp = match control_run_collect(client, control_ctx, &command::select(&wire)) {
+        let select_resp = match select_folder(client, control_ctx, folder) {
             Ok(r) => r,
             Err(e) => {
                 log_at(

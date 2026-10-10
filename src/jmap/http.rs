@@ -9,8 +9,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use encodify::base64::STANDARD;
 use serde_json::Value;
 use ureq::Agent;
 use ureq::config::{Config, RedirectAuthHeaders};
@@ -27,14 +26,24 @@ const MAX_BODY: u64 = 512 * 1024 * 1024;
 
 const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
 
+const BASIC: &str = "Basic ";
+
 #[derive(Debug, Clone)]
 pub enum Auth {
-    Basic { user: String, password: String },
-    Bearer { token: String },
+    Basic {
+        user: String,
+        password: String,
+    },
+    Bearer {
+        token: String,
+    },
     /// Raw session-cookie auth (e.g. Zimbra's ZM_AUTH_TOKEN delegate-auth
     /// token, which Zimbra's CalDAV/CardDAV endpoints only accept via
     /// Cookie - not Authorization: Bearer, confirmed empirically).
-    Cookie { name: String, value: String },
+    Cookie {
+        name: String,
+        value: String,
+    },
 }
 
 impl Auth {
@@ -50,7 +59,12 @@ impl Auth {
     pub fn header_value(&self) -> String {
         match self {
             Auth::Basic { user, password } => {
-                format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
+                let credentials = format!("{user}:{password}");
+                let mut header =
+                    String::with_capacity(BASIC.len() + STANDARD.encoded_len(credentials.len()));
+                header.push_str(BASIC);
+                STANDARD.encode_append(credentials, &mut header);
+                header
             }
             Auth::Bearer { token } => format!("Bearer {token}"),
             Auth::Cookie { name, value } => format!("{name}={value}"),
@@ -632,9 +646,11 @@ fn format_rate_headers(headers: &[(String, String)]) -> Option<String> {
     Some(parts.join("; "))
 }
 
-fn format_retry_wait(d: Duration) -> String {
+pub fn format_retry_wait(d: Duration) -> String {
     let total = d.as_secs();
-    if total < 60 {
+    if total == 0 {
+        format!("{}ms", d.as_millis())
+    } else if total < 60 {
         format!("{total}s")
     } else if total < 3600 {
         format!("{}m{:02}s", total / 60, total % 60)
@@ -667,6 +683,16 @@ mod tests {
             token: "abc.def".to_owned(),
         };
         assert_eq!(auth.header_value(), "Bearer abc.def");
+    }
+
+    #[test]
+    fn delegate_auth_uses_cookie_header() {
+        let auth = Auth::Cookie {
+            name: "ZM_AUTH_TOKEN".to_owned(),
+            value: "delegate-token".to_owned(),
+        };
+        assert_eq!(auth.header_name(), "Cookie");
+        assert_eq!(auth.header_value(), "ZM_AUTH_TOKEN=delegate-token");
     }
 
     #[test]
@@ -841,6 +867,7 @@ mod tests {
 
     #[test]
     fn format_retry_wait_short_medium_long() {
+        assert_eq!(format_retry_wait(Duration::from_millis(250)), "250ms");
         assert_eq!(format_retry_wait(Duration::from_secs(7)), "7s");
         assert_eq!(format_retry_wait(Duration::from_secs(67)), "1m07s");
         assert_eq!(format_retry_wait(Duration::from_secs(1427)), "23m47s");

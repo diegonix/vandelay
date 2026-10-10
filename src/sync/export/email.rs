@@ -12,7 +12,8 @@ use super::common::{jid, target_query_get};
 use super::{Maps, Net, Plan, Uploader};
 use crate::error::Error;
 use crate::jmap::error::JmapError;
-use crate::jmap::request::{Request, check_method_error, get_objects};
+use crate::jmap::request::{Request, check_method_error, get_objects, retry_method_call};
+use crate::jmap::retry::MethodCallKind;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{EMAIL_SELECT, EmailRow, TargetResolver, row_to_email};
@@ -126,7 +127,8 @@ pub fn reconcile(
             continue;
         }
         let (local_id, row) = &local[i];
-        if let Some(pending) = prepare_import(net, &mut uploader, maps, *local_id, row, counts, logger)
+        if let Some(pending) =
+            prepare_import(net, &mut uploader, maps, *local_id, row, counts, logger)
         {
             batch.push(pending);
             if batch.len() >= chunk {
@@ -270,7 +272,7 @@ fn flush_import_batch(
     if batch.is_empty() {
         return;
     }
-    let outcomes = match send_import_batch(net, batch) {
+    let outcomes = match send_import_batch(net, batch, logger) {
         Ok(o) => o,
         Err(e) => {
             // A transport/method-level failure fails the whole batch; count and
@@ -280,7 +282,11 @@ fn flush_import_batch(
                     "Email/import {} ({}) send failed{}: {e}{}",
                     p.cid,
                     blob_hint(uploader, p.row),
-                    if is_retry { " after blob re-upload" } else { "" },
+                    if is_retry {
+                        " after blob re-upload"
+                    } else {
+                        ""
+                    },
                     size_note(&e)
                 ));
                 counts.failed += 1;
@@ -317,7 +323,11 @@ fn flush_import_batch(
                     "Email/import {} ({}) failed{}: {detail}",
                     p.cid,
                     blob_hint(uploader, p.row),
-                    if is_retry { " after blob re-upload" } else { "" }
+                    if is_retry {
+                        " after blob re-upload"
+                    } else {
+                        ""
+                    }
                 ));
                 counts.failed += 1;
             }
@@ -380,6 +390,7 @@ fn flush_import_batch(
 fn send_import_batch(
     net: &Net,
     batch: &[Pending],
+    logger: &Logger,
 ) -> Result<HashMap<String, ImportOutcome>, JmapError> {
     if batch.is_empty() {
         return Ok(HashMap::new());
@@ -402,15 +413,24 @@ fn send_import_batch(
             return Ok(out);
         }
         let mid = batch.len() / 2;
-        let mut left = send_import_batch(net, &batch[..mid])?;
-        let right = send_import_batch(net, &batch[mid..])?;
+        let mut left = send_import_batch(net, &batch[..mid], logger)?;
+        let right = send_import_batch(net, &batch[mid..], logger)?;
         left.extend(right);
         return Ok(left);
     }
 
-    let resp = req.send(&net.client, &net.api)?;
+    let resp = retry_method_call(
+        &net.client,
+        // This conservative write policy never retries a partially applied batch.
+        MethodCallKind::SingleObjectWrite,
+        logger,
+        || {
+            let resp = req.send(&net.client, &net.api)?;
+            check_method_error(resp.first()?)?;
+            Ok(resp)
+        },
+    )?;
     let mr = resp.first()?;
-    check_method_error(mr)?;
     let not_created = mr.args.get("notCreated").and_then(Value::as_object);
     let created = mr.args.get("created").and_then(Value::as_object);
 

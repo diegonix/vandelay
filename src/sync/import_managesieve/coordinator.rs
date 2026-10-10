@@ -43,7 +43,10 @@ pub enum ManageSieveAuth {
         /// as (Zimbra admin impersonation). `None` = normal, non-impersonated auth.
         proxy_user: Option<String>,
     },
-    Bearer { user: String, token: String },
+    Bearer {
+        user: String,
+        token: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -463,9 +466,7 @@ fn do_authenticate(client: &mut SieveClient, auth: &ManageSieveAuth) -> Result<(
             if authzid.is_some() {
                 let detail = last_plain_error
                     .map(|p| format!(": {p}"))
-                    .unwrap_or_else(|| {
-                        format!(" (server SASL list lacks PLAIN: {:?})", caps.sasl)
-                    });
+                    .unwrap_or_else(|| format!(" (server SASL list lacks PLAIN: {:?})", caps.sasl));
                 return Err(SieveAuthError::TerminallyRefused(format!(
                     "--auth-proxy-user requires SASL PLAIN; LOGIN cannot carry an \
                      impersonation target{detail}"
